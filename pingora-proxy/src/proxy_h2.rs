@@ -18,7 +18,11 @@ use crate::proxy_common::*;
 use pingora_core::protocols::http::v2::client::{write_body, Http2Session};
 
 // add scheme and authority as required by h2 lib
-fn update_h2_scheme_authority(header: &mut http::request::Parts, raw_host: &[u8]) -> Result<()> {
+fn update_h2_scheme_authority(
+    header: &mut http::request::Parts,
+    raw_host: &[u8],
+    tls: bool,
+) -> Result<()> {
     let authority = if let Ok(s) = std::str::from_utf8(raw_host) {
         if s.starts_with('[') {
             // don't mess with ipv6 host
@@ -43,8 +47,9 @@ fn update_h2_scheme_authority(header: &mut http::request::Parts, raw_host: &[u8]
         );
     };
 
+    let scheme = if tls { "https" } else { "http" };
     let uri = http::uri::Builder::new()
-        .scheme("https")
+        .scheme(scheme)
         .authority(authority)
         .path_and_query(header.uri.path_and_query().as_ref().unwrap().as_str())
         .build();
@@ -123,7 +128,7 @@ impl<SV> HttpProxy<SV> {
 
         // H2 requires authority to be set, so copy that from H1 host if that is set
         if let Some(host) = host {
-            if let Err(e) = update_h2_scheme_authority(&mut req, host.as_bytes()) {
+            if let Err(e) = update_h2_scheme_authority(&mut req, host.as_bytes(), peer.is_tls()) {
                 return (false, Some(e));
             }
         }
@@ -223,7 +228,14 @@ impl<SV> HttpProxy<SV> {
 
         // retry, send buffer if it exists
         if let Some(buffer) = session.as_mut().get_retry_buffer() {
-            send_body_to2(Ok(Some(buffer)), downstream_state.is_done(), client_body)?;
+            self.send_body_to2(
+                session,
+                Some(buffer),
+                downstream_state.is_done(),
+                client_body,
+                ctx,
+            )
+            .await?;
         }
 
         let mut response_state = ResponseStateMachine::new();
@@ -260,7 +272,10 @@ impl<SV> HttpProxy<SV> {
                            }
                         }
                     };
-                    let request_done = send_body_to2(Ok(body), session.is_body_done(), client_body)?;
+                    let is_body_done = session.is_body_done();
+                    let request_done =
+                        self.send_body_to2(session, body, is_body_done, client_body, ctx)
+                        .await?;
                     downstream_state.maybe_finished(request_done);
                 },
 
@@ -381,7 +396,7 @@ impl<SV> HttpProxy<SV> {
         SV::CTX: Send + Sync,
     {
         if !from_cache {
-            self.upstream_filter(session, &mut task, ctx);
+            self.upstream_filter(session, &mut task, ctx)?;
 
             // cache the original response before any downstream transformation
             // requests that bypassed cache still need to run filters to see if the response has become cacheable
@@ -457,18 +472,18 @@ impl<SV> HttpProxy<SV> {
                     .inner
                     .response_body_filter(session, &mut data, eos, ctx)?
                 {
-                    trace!("delaying response for {:?}", duration);
+                    trace!("delaying response for {duration:?}");
                     time::sleep(duration).await;
                 }
                 Ok(HttpTask::Body(data, eos))
             }
-            HttpTask::Trailer(header_map) => {
-                let trailer_buffer = match header_map {
-                    Some(mut trailer_map) => {
+            HttpTask::Trailer(mut trailers) => {
+                let trailer_buffer = match trailers.as_mut() {
+                    Some(trailers) => {
                         debug!("Parsing response trailers..");
                         match self
                             .inner
-                            .response_trailer_filter(session, &mut trailer_map, ctx)
+                            .response_trailer_filter(session, trailers, ctx)
                             .await
                         {
                             Ok(buf) => buf,
@@ -490,45 +505,47 @@ impl<SV> HttpProxy<SV> {
                     // https://http2.github.io/http2-spec/#malformed
                     Ok(HttpTask::Body(Some(buffer), true))
                 } else {
-                    Ok(HttpTask::Done)
+                    Ok(HttpTask::Trailer(trailers))
                 }
             }
             HttpTask::Done => Ok(task),
             HttpTask::Failed(_) => Ok(task), // Do nothing just pass the error down
         }
     }
-}
 
-pub(crate) fn send_body_to2(
-    data: Result<Option<Bytes>>,
-    end_of_body: bool,
-    client_body: &mut h2::SendStream<bytes::Bytes>,
-) -> Result<bool> {
-    match data {
-        Ok(res) => match res {
-            Some(data) => {
-                let data_len = data.len();
-                debug!(
-                    "Read {} bytes body from downstream, body end: {}",
-                    data_len, end_of_body
-                );
-                if data_len == 0 && !end_of_body {
-                    /* it is normal to get 0 bytes because of multi-chunk parsing */
-                    return Ok(false);
-                }
-                write_body(client_body, data, end_of_body).map_err(|e| e.into_up())?;
-                debug!("Write {} bytes body to h2 upstream", data_len);
-                Ok(end_of_body)
-            }
-            None => {
-                debug!("Read downstream body done");
-                /* send a standalone END_STREAM flag */
-                write_body(client_body, Bytes::new(), true).map_err(|e| e.into_up())?;
-                debug!("Write END_STREAM to h2 upstream");
-                Ok(true)
-            }
-        },
-        Err(e) => e.into_down().into_err(),
+    async fn send_body_to2(
+        &self,
+        session: &mut Session,
+        mut data: Option<Bytes>,
+        end_of_body: bool,
+        client_body: &mut h2::SendStream<bytes::Bytes>,
+        ctx: &mut SV::CTX,
+    ) -> Result<bool>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        self.inner
+            .request_body_filter(session, &mut data, end_of_body, ctx)
+            .await?;
+
+        /* it is normal to get 0 bytes because of multi-chunk parsing or request_body_filter.
+         * Although there is no harm writing empty byte to h2, unlike h1, we ignore it
+         * for consistency */
+        if !end_of_body && data.as_ref().map_or(false, |d| d.is_empty()) {
+            return Ok(false);
+        }
+
+        if let Some(data) = data {
+            debug!("Write {} bytes body to h2 upstream", data.len());
+            write_body(client_body, data, end_of_body).map_err(|e| e.into_up())?;
+        } else {
+            debug!("Read downstream body done");
+            /* send a standalone END_STREAM flag */
+            write_body(client_body, Bytes::new(), true).map_err(|e| e.into_up())?;
+        }
+
+        Ok(end_of_body)
     }
 }
 
@@ -607,14 +624,20 @@ fn test_update_authority() {
         .unwrap()
         .into_parts()
         .0;
-    update_h2_scheme_authority(&mut parts, b"example.com").unwrap();
+    update_h2_scheme_authority(&mut parts, b"example.com", true).unwrap();
     assert_eq!("example.com", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:456").unwrap();
+    update_h2_scheme_authority(&mut parts, b"example.com:456", true).unwrap();
     assert_eq!("example.com:456", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:").unwrap();
+    update_h2_scheme_authority(&mut parts, b"example.com:", true).unwrap();
     assert_eq!("example.com:", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:123:345").unwrap();
+    update_h2_scheme_authority(&mut parts, b"example.com:123:345", true).unwrap();
     assert_eq!("example.com:123", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"[::1]").unwrap();
+    update_h2_scheme_authority(&mut parts, b"[::1]", true).unwrap();
     assert_eq!("[::1]", parts.uri.authority().unwrap());
+
+    // verify scheme
+    update_h2_scheme_authority(&mut parts, b"example.com", true).unwrap();
+    assert_eq!("https://example.com", parts.uri);
+    update_h2_scheme_authority(&mut parts, b"example.com", false).unwrap();
+    assert_eq!("http://example.com", parts.uri);
 }

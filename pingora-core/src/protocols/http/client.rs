@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use super::v1::client::HttpSession as Http1Session;
 use super::v2::client::Http2Session;
-use crate::protocols::{Digest, SocketAddr};
+use crate::protocols::{Digest, SocketAddr, Stream};
 
 /// A type for Http client session. It can be either an Http1 connection or an Http2 stream.
 pub enum HttpSession {
@@ -89,7 +89,9 @@ impl HttpSession {
 
     /// Set the write timeout for writing header and body.
     ///
-    /// The timeout is per write operation, not on the overall time writing the entire request
+    /// The timeout is per write operation, not on the overall time writing the entire request.
+    ///
+    /// This is a noop for h2.
     pub fn set_write_timeout(&mut self, timeout: Duration) {
         match self {
             HttpSession::H1(h1) => h1.write_timeout = Some(timeout),
@@ -151,11 +153,21 @@ impl HttpSession {
     /// Return the [Digest] of the connection
     ///
     /// For reused connection, the timing in the digest will reflect its initial handshakes
-    /// The caller should check if the connection is reused to avoid misuse of the timing field
+    /// The caller should check if the connection is reused to avoid misuse of the timing field.
     pub fn digest(&self) -> Option<&Digest> {
         match self {
             Self::H1(s) => Some(s.digest()),
             Self::H2(s) => s.digest(),
+        }
+    }
+
+    /// Return a mutable [Digest] reference for the connection, see [`digest`] for more details.
+    ///
+    /// Will return `None` if this is an H2 session and multiple streams are open.
+    pub fn digest_mut(&mut self) -> Option<&mut Digest> {
+        match self {
+            Self::H1(s) => Some(s.digest_mut()),
+            Self::H2(s) => s.digest_mut(),
         }
     }
 
@@ -172,6 +184,15 @@ impl HttpSession {
         match self {
             Self::H1(s) => s.client_addr(),
             Self::H2(s) => s.client_addr(),
+        }
+    }
+
+    /// Get the reference of the [Stream] that this HTTP/1 session is operating upon.
+    /// None if the HTTP session is over H2
+    pub fn stream(&self) -> Option<&Stream> {
+        match self {
+            Self::H1(s) => Some(s.stream()),
+            Self::H2(_) => None,
         }
     }
 }

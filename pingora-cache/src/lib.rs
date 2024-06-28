@@ -21,7 +21,7 @@ use key::{CacheHashKey, HashBinary};
 use lock::WritePermit;
 use pingora_error::Result;
 use pingora_http::ResponseHeader;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use trace::CacheTraceCTX;
 
 pub mod cache_control;
@@ -44,7 +44,7 @@ pub use key::CacheKey;
 use lock::{CacheLock, LockStatus, Locked};
 pub use memory::MemCache;
 pub use meta::{CacheMeta, CacheMetaDefaults};
-pub use storage::{HitHandler, MissHandler, Storage};
+pub use storage::{HitHandler, MissHandler, PurgeType, Storage};
 pub use variance::VarianceBuilder;
 
 pub mod prelude {}
@@ -222,6 +222,8 @@ struct HttpCacheInner {
     pub lock: Option<Locked>, // TODO: these 3 fields should come in 1 sub struct
     pub cache_lock: Option<&'static CacheLock>,
     pub lock_duration: Option<Duration>,
+    // time spent in cache lookup and reading the header
+    pub lookup_duration: Option<Duration>,
     pub traces: trace::CacheTraceCTX,
 }
 
@@ -369,6 +371,7 @@ impl HttpCache {
                     lock: None,
                     cache_lock,
                     lock_duration: None,
+                    lookup_duration: None,
                     traces: CacheTraceCTX::new(),
                 }));
             }
@@ -655,7 +658,10 @@ impl HttpCache {
                     let handle = span.handle();
                     for item in evicted {
                         // TODO: warn/log the error
-                        let _ = inner.storage.purge(&item, &handle).await;
+                        let _ = inner
+                            .storage
+                            .purge(&item, PurgeType::Eviction, &handle)
+                            .await;
                     }
                 }
                 inner.traces.finish_miss_span();
@@ -896,7 +902,15 @@ impl HttpCache {
                 let inner = self.inner_mut();
                 let mut span = inner.traces.child("lookup");
                 let key = inner.key.as_ref().unwrap(); // safe, this phase should have cache key
+                let now = Instant::now();
                 let result = inner.storage.lookup(key, &span.handle()).await?;
+                let lookup_duration = now.elapsed();
+                // one request may have multiple lookups
+                inner.lookup_duration = Some(
+                    inner
+                        .lookup_duration
+                        .map_or(lookup_duration, |d| d + lookup_duration),
+                );
                 let result = result.and_then(|(meta, header)| {
                     if let Some(ts) = inner.valid_after {
                         if meta.created() < ts {
@@ -1015,7 +1029,7 @@ impl HttpCache {
         let _span = inner.traces.child("cache_lock");
         let lock = inner.lock.take(); // remove the lock from self
         if let Some(Locked::Read(r)) = lock {
-            let now = std::time::Instant::now();
+            let now = Instant::now();
             r.wait().await;
             let lock_duration = now.elapsed();
             // it's possible for a request to be locked more than once
@@ -1037,6 +1051,12 @@ impl HttpCache {
         self.inner.as_ref().and_then(|i| i.lock_duration)
     }
 
+    /// How long did this request spent on cache lookup and reading the header
+    pub fn lookup_duration(&self) -> Option<Duration> {
+        // FIXME: this duration is lost when cache is disabled
+        self.inner.as_ref().and_then(|i| i.lookup_duration)
+    }
+
     /// Delete the asset from the cache storage
     /// # Panic
     /// Need to be called after the cache key is set. Panic otherwise.
@@ -1046,7 +1066,10 @@ impl HttpCache {
                 let inner = self.inner_mut();
                 let mut span = inner.traces.child("purge");
                 let key = inner.key.as_ref().unwrap().to_compact();
-                let result = inner.storage.purge(&key, &span.handle()).await;
+                let result = inner
+                    .storage
+                    .purge(&key, PurgeType::Invalidation, &span.handle())
+                    .await;
                 // FIXME: also need to remove from eviction manager
                 span.set_tag(|| trace::Tag::new("purged", matches!(result, Ok(true))));
                 result

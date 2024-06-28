@@ -14,6 +14,9 @@
 
 use super::cert;
 use async_trait::async_trait;
+use clap::Parser;
+use http::header::VARY;
+use http::HeaderValue;
 use once_cell::sync::Lazy;
 use pingora_cache::cache_control::CacheControl;
 use pingora_cache::key::HashBinary;
@@ -23,6 +26,8 @@ use pingora_cache::{
     set_compression_dict_path, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason,
     RespCacheable,
 };
+use pingora_core::apps::{HttpServerApp, HttpServerOptions};
+use pingora_core::modules::http::compression::ResponseCompression;
 use pingora_core::protocols::{l4::socket::SocketAddr, Digest};
 use pingora_core::server::configuration::Opt;
 use pingora_core::services::Service;
@@ -31,9 +36,10 @@ use pingora_core::utils::CertKey;
 use pingora_error::{Error, ErrorSource, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread;
-use structopt::StructOpt;
+use std::time::Duration;
 
 pub struct ExampleProxyHttps {}
 
@@ -203,14 +209,56 @@ impl ProxyHttp for ExampleProxyHttp {
         CTX::default()
     }
 
-    async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+    async fn early_request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
         let req = session.req_header();
         let downstream_compression = req.headers.get("x-downstream-compression").is_some();
         if downstream_compression {
-            session.downstream_compression.adjust_level(6);
+            session
+                .downstream_modules_ctx
+                .get_mut::<ResponseCompression>()
+                .unwrap()
+                .adjust_level(6);
         } else {
             // enable upstream compression for all requests by default
             session.upstream_compression.adjust_level(6);
+        }
+        Ok(())
+    }
+
+    async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+        let req = session.req_header();
+
+        let write_timeout = req
+            .headers
+            .get("x-write-timeout")
+            .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()));
+
+        let min_rate = req
+            .headers
+            .get("x-min-rate")
+            .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()));
+
+        let downstream_compression = req.headers.get("x-downstream-compression").is_some();
+        if !downstream_compression {
+            // enable upstream compression for all requests by default
+            session.upstream_compression.adjust_level(6);
+            // also disable downstream compression in order to test the upstream one
+            session
+                .downstream_modules_ctx
+                .get_mut::<ResponseCompression>()
+                .unwrap()
+                .adjust_level(0);
+        }
+
+        if let Some(min_rate) = min_rate {
+            session.set_min_send_rate(min_rate);
+        }
+        if let Some(write_timeout) = write_timeout {
+            session.set_write_timeout(Duration::from_secs(write_timeout));
         }
 
         Ok(false)
@@ -236,17 +284,24 @@ impl ProxyHttp for ExampleProxyHttp {
                 "/tmp/nginx-test.sock",
                 false,
                 "".to_string(),
-            )));
+            )?));
         }
         let port = req
             .headers
             .get("x-port")
             .map_or("8000", |v| v.to_str().unwrap());
-        let peer = Box::new(HttpPeer::new(
+
+        let mut peer = Box::new(HttpPeer::new(
             format!("127.0.0.1:{port}"),
             false,
             "".to_string(),
         ));
+
+        if session.get_header_bytes("x-h2") == b"true" {
+            // default is 1, 1
+            peer.options.set_http_version(2, 2);
+        }
+
         Ok(peer)
     }
 
@@ -269,6 +324,9 @@ static CACHE_PREDICTOR: Lazy<Predictor<32>> = Lazy::new(|| Predictor::new(5, Non
 static EVICTION_MANAGER: Lazy<Manager> = Lazy::new(|| Manager::new(8192)); // 8192 bytes
 static CACHE_LOCK: Lazy<CacheLock> =
     Lazy::new(|| CacheLock::new(std::time::Duration::from_secs(2)));
+// Example of how one might restrict which fields can be varied on.
+static CACHE_VARY_ALLOWED_HEADERS: Lazy<Option<HashSet<&str>>> =
+    Lazy::new(|| Some(vec!["accept", "accept-encoding"].into_iter().collect()));
 
 // #[allow(clippy::upper_case_acronyms)]
 pub struct CacheCTX {
@@ -342,15 +400,41 @@ impl ProxyHttp for ExampleProxyCache {
 
     fn cache_vary_filter(
         &self,
-        _meta: &CacheMeta,
+        meta: &CacheMeta,
         _ctx: &mut Self::CTX,
         req: &RequestHeader,
     ) -> Option<HashBinary> {
-        // Here the response is always vary on request header "x-vary-me" if it exists
-        // in the real world, this callback should check Vary response header to decide
-        let vary_me = req.headers.get("x-vary-me")?;
         let mut key = VarianceBuilder::new();
-        key.add_value("headers.x-vary-me", vary_me);
+
+        // Vary per header from origin. Target headers are de-duplicated by key logic.
+        let vary_headers_lowercased: Vec<String> = meta
+            .headers()
+            .get_all(VARY)
+            .iter()
+            // Filter out any unparseable vary headers.
+            .flat_map(|vary_header| vary_header.to_str().ok())
+            .flat_map(|vary_header| vary_header.split(','))
+            .map(|s| s.trim().to_lowercase())
+            .filter(|header_name| {
+                // Filter only for allowed headers, if restricted.
+                CACHE_VARY_ALLOWED_HEADERS
+                    .as_ref()
+                    .map(|al| al.contains(header_name.as_str()))
+                    .unwrap_or(true)
+            })
+            .collect();
+
+        vary_headers_lowercased.iter().for_each(|header_name| {
+            // Add this header and value to be considered in the variance key.
+            key.add_value(
+                header_name,
+                req.headers
+                    .get(header_name)
+                    .map(|v| v.as_bytes())
+                    .unwrap_or(&[]),
+            );
+        });
+
         key.finalize()
     }
 
@@ -437,13 +521,22 @@ fn test_main() {
         "-c".into(),
         "tests/pingora_conf.yaml".into(),
     ];
-    let mut my_server = pingora_core::server::Server::new(Some(Opt::from_iter(opts))).unwrap();
+    let mut my_server = pingora_core::server::Server::new(Some(Opt::parse_from(opts))).unwrap();
     my_server.bootstrap();
 
     let mut proxy_service_http =
         pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttp {});
     proxy_service_http.add_tcp("0.0.0.0:6147");
     proxy_service_http.add_uds("/tmp/pingora_proxy.sock", None);
+
+    let mut proxy_service_h2c =
+        pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttp {});
+
+    let http_logic = proxy_service_h2c.app_logic_mut().unwrap();
+    let mut http_server_options = HttpServerOptions::default();
+    http_server_options.h2c = true;
+    http_logic.server_options = Some(http_server_options);
+    proxy_service_h2c.add_tcp("0.0.0.0:6146");
 
     let mut proxy_service_https =
         pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttps {});
@@ -460,6 +553,7 @@ fn test_main() {
     proxy_service_cache.add_tcp("0.0.0.0:6148");
 
     let services: Vec<Box<dyn Service>> = vec![
+        Box::new(proxy_service_h2c),
         Box::new(proxy_service_http),
         Box::new(proxy_service_https),
         Box::new(proxy_service_cache),

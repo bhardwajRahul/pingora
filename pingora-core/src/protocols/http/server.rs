@@ -18,13 +18,14 @@ use super::error_resp;
 use super::v1::server::HttpSession as SessionV1;
 use super::v2::server::HttpSession as SessionV2;
 use super::HttpTask;
-use crate::protocols::{SocketAddr, Stream};
+use crate::protocols::{Digest, SocketAddr, Stream};
 use bytes::Bytes;
-use http::header::AsHeaderName;
 use http::HeaderValue;
+use http::{header::AsHeaderName, HeaderMap};
 use log::error;
 use pingora_error::Result;
 use pingora_http::{RequestHeader, ResponseHeader};
+use std::time::Duration;
 
 /// HTTP server session object for both HTTP/1.x and HTTP/2
 pub enum Session {
@@ -131,13 +132,27 @@ impl Session {
     }
 
     /// Write the response body to client
-    pub async fn write_response_body(&mut self, data: Bytes) -> Result<()> {
+    pub async fn write_response_body(&mut self, data: Bytes, end: bool) -> Result<()> {
+        if data.is_empty() && !end {
+            // writing 0 byte to a chunked encoding h1 would finish the stream
+            // writing 0 bytes to h2 is noop
+            // we don't want to actually write in either cases
+            return Ok(());
+        }
         match self {
             Self::H1(s) => {
                 s.write_body(&data).await?;
                 Ok(())
             }
-            Self::H2(s) => s.write_body(data, false),
+            Self::H2(s) => s.write_body(data, end),
+        }
+    }
+
+    /// Write the response trailers to client
+    pub async fn write_response_trailers(&mut self, trailers: HeaderMap) -> Result<()> {
+        match self {
+            Self::H1(_) => Ok(()), // TODO: support trailers for h1
+            Self::H2(s) => s.write_trailers(trailers),
         }
     }
 
@@ -170,6 +185,35 @@ impl Session {
     pub fn set_keepalive(&mut self, duration: Option<u64>) {
         match self {
             Self::H1(s) => s.set_server_keepalive(duration),
+            Self::H2(_) => {}
+        }
+    }
+
+    /// Sets the downstream write timeout. This will trigger if we're unable
+    /// to write to the stream after `duration`. If a `min_send_rate` is
+    /// configured then the `min_send_rate` calculated timeout has higher priority.
+    ///
+    /// This is a noop for h2.
+    pub fn set_write_timeout(&mut self, timeout: Duration) {
+        match self {
+            Self::H1(s) => s.set_write_timeout(timeout),
+            Self::H2(_) => {}
+        }
+    }
+
+    /// Sets the minimum downstream send rate in bytes per second. This
+    /// is used to calculate a write timeout in seconds based on the size
+    /// of the buffer being written. If a `min_send_rate` is configured it
+    /// has higher priority over a set `write_timeout`. The minimum send
+    /// rate must be greater than zero.
+    ///
+    /// Calculated write timeout is guaranteed to be at least 1s if `min_send_rate`
+    /// is greater than zero, a send rate of zero is a noop.
+    ///
+    /// This is a noop for h2.
+    pub fn set_min_send_rate(&mut self, rate: usize) {
+        match self {
+            Self::H1(s) => s.set_min_send_rate(rate),
             Self::H2(_) => {}
         }
     }
@@ -228,14 +272,18 @@ impl Session {
         }
     }
 
-    /// Send error response to client
-    pub async fn respond_error(&mut self, error: u16) {
-        let resp = match error {
+    pub fn generate_error(error: u16) -> ResponseHeader {
+        match error {
             /* common error responses are pre-generated */
             502 => error_resp::HTTP_502_RESPONSE.clone(),
             400 => error_resp::HTTP_400_RESPONSE.clone(),
             _ => error_resp::gen_error_response(error),
-        };
+        }
+    }
+
+    /// Send error response to client
+    pub async fn respond_error(&mut self, error: u16) {
+        let resp = Self::generate_error(error);
 
         // TODO: we shouldn't be closing downstream connections on internally generated errors
         // and possibly other upstream connect() errors (connection refused, timeout, etc)
@@ -323,7 +371,7 @@ impl Session {
         }
     }
 
-    /// How many response body bytes already sent
+    /// Return how many response body bytes (application, not wire) already sent downstream
     pub fn body_bytes_sent(&self) -> usize {
         match self {
             Self::H1(s) => s.body_bytes_sent(),
@@ -331,7 +379,33 @@ impl Session {
         }
     }
 
-    /// Return the client (peer) address of the connnection.
+    /// Return how many request body bytes (application, not wire) already read from downstream
+    pub fn body_bytes_read(&self) -> usize {
+        match self {
+            Self::H1(s) => s.body_bytes_read(),
+            Self::H2(s) => s.body_bytes_read(),
+        }
+    }
+
+    /// Return the [Digest] for the connection.
+    pub fn digest(&self) -> Option<&Digest> {
+        match self {
+            Self::H1(s) => Some(s.digest()),
+            Self::H2(s) => s.digest(),
+        }
+    }
+
+    /// Return a mutable [Digest] reference for the connection.
+    ///
+    /// Will return `None` if multiple H2 streams are open.
+    pub fn digest_mut(&mut self) -> Option<&mut Digest> {
+        match self {
+            Self::H1(s) => Some(s.digest_mut()),
+            Self::H2(s) => s.digest_mut(),
+        }
+    }
+
+    /// Return the client (peer) address of the connection.
     pub fn client_addr(&self) -> Option<&SocketAddr> {
         match self {
             Self::H1(s) => s.client_addr(),
@@ -344,6 +418,15 @@ impl Session {
         match self {
             Self::H1(s) => s.server_addr(),
             Self::H2(s) => s.server_addr(),
+        }
+    }
+
+    /// Get the reference of the [Stream] that this HTTP/1 session is operating upon.
+    /// None if the HTTP session is over H2
+    pub fn stream(&self) -> Option<&Stream> {
+        match self {
+            Self::H1(s) => Some(s.stream()),
+            Self::H2(_) => None,
         }
     }
 }

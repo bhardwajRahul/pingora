@@ -14,6 +14,7 @@
 
 use super::*;
 use pingora_cache::{key::HashBinary, CacheKey, CacheMeta, RespCacheable, RespCacheable::*};
+use std::time::Duration;
 
 /// The interface to control the HTTP proxy
 ///
@@ -39,6 +40,17 @@ pub trait ProxyHttp {
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>>;
 
+    /// Set up downstream modules.
+    ///
+    /// In this phase, users can add or configure [HttpModules] before the server starts up.
+    ///
+    /// In the default implementation of this method, [ResponseCompressionBuilder] is added
+    /// and disabled.
+    fn init_downstream_modules(&self, modules: &mut HttpModules) {
+        // Add disabled downstream compression module by default
+        modules.add_module(ResponseCompressionBuilder::enable(0));
+    }
+
     /// Handle the incoming request.
     ///
     /// In this phase, users can parse, validate, rate limit, perform access control and/or
@@ -53,6 +65,43 @@ pub trait ProxyHttp {
         Self::CTX: Send + Sync,
     {
         Ok(false)
+    }
+
+    /// Handle the incoming request before any downstream module is executed.
+    ///
+    /// This function is similar to [Self::request_filter()] but execute before any other logic
+    /// especially the downstream modules. The main purpose of this function is to provide finer
+    /// grained control of behavior of the modules.
+    ///
+    /// Note that because this function is executed before any module that might provide access
+    /// control or rate limiting, logic should stay in request_filter() if it can in order to be
+    /// protected by said modules.
+    async fn early_request_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(())
+    }
+
+    /// Handle the incoming request body.
+    ///
+    /// This function will be called every time a piece of request body is received. The `body` is
+    /// **not the entire request body**.
+    ///
+    /// The async nature of this function allows to throttle the upload speed and/or executing
+    /// heavy computation logic such as WAF rules on offloaded threads without blocking the threads
+    /// who process the requests themselves.
+    async fn request_body_filter(
+        &self,
+        _session: &mut Session,
+        _body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(())
     }
 
     /// This filter decides if the request is cacheable and what cache backend to use
@@ -87,9 +136,9 @@ pub trait ProxyHttp {
     // flex purge, other filtering, returns whether asset is should be force expired or not
     async fn cache_hit_filter(
         &self,
+        _session: &Session,
         _meta: &CacheMeta,
         _ctx: &mut Self::CTX,
-        _req: &RequestHeader,
     ) -> Result<bool>
     where
         Self::CTX: Send + Sync,
@@ -221,6 +270,16 @@ pub trait ProxyHttp {
     ) {
     }
 
+    /// Similar to [Self::upstream_response_filter()] but for response trailers
+    fn upstream_response_trailer_filter(
+        &self,
+        _session: &mut Session,
+        _upstream_trailers: &mut header::HeaderMap,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Similar to [Self::response_filter()] but for response body chunks
     fn response_body_filter(
         &self,
@@ -228,14 +287,18 @@ pub trait ProxyHttp {
         _body: &mut Option<Bytes>,
         _end_of_stream: bool,
         _ctx: &mut Self::CTX,
-    ) -> Result<Option<std::time::Duration>>
+    ) -> Result<Option<Duration>>
     where
         Self::CTX: Send + Sync,
     {
         Ok(None)
     }
 
-    /// When a trailer is received.
+    /// Similar to [Self::response_filter()] but for response trailers.
+    /// Note, returning an Ok(Some(Bytes)) will result in the downstream response
+    /// trailers being written to the response body.
+    ///
+    /// TODO: make this interface more intuitive
     async fn response_trailer_filter(
         &self,
         _session: &mut Session,
@@ -385,5 +448,21 @@ pub trait ProxyHttp {
     /// - `false`: this request is a treated as a normal request
     fn is_purge(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
         false
+    }
+
+    /// This filter is called after the proxy cache generates the downstream response to the purge
+    /// request (to invalidate or delete from the HTTP cache), based on the purge status, which
+    /// indicates whether the request succeeded or failed.
+    ///
+    /// The filter allows the user to modify or replace the generated downstream response.
+    /// If the filter returns `Err`, the proxy will instead send a 500 response.
+    fn purge_response_filter(
+        &self,
+        _session: &Session,
+        _ctx: &mut Self::CTX,
+        _purge_status: PurgeStatus,
+        _purge_response: &mut std::borrow::Cow<'static, ResponseHeader>,
+    ) -> Result<()> {
+        Ok(())
     }
 }

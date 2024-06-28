@@ -38,6 +38,15 @@ pub struct TlsSettings {
     callbacks: Option<TlsAcceptCallbacks>,
 }
 
+impl From<SslAcceptorBuilder> for TlsSettings {
+    fn from(settings: SslAcceptorBuilder) -> Self {
+        TlsSettings {
+            accept_builder: settings,
+            callbacks: None,
+        }
+    }
+}
+
 impl Deref for TlsSettings {
     type Target = SslAcceptorBuilder;
 
@@ -63,10 +72,12 @@ impl TlsSettings {
         )?;
         accept_builder
             .set_private_key_file(key_path, SslFiletype::PEM)
-            .or_err(TLS_CONF_ERR, "fail to read key file {key_path}")?;
+            .or_err_with(TLS_CONF_ERR, || format!("fail to read key file {key_path}"))?;
         accept_builder
             .set_certificate_chain_file(cert_path)
-            .or_err(TLS_CONF_ERR, "fail to read cert file {cert_path}")?;
+            .or_err_with(TLS_CONF_ERR, || {
+                format!("fail to read cert file {cert_path}")
+            })?;
         Ok(TlsSettings {
             accept_builder,
             callbacks: None,
